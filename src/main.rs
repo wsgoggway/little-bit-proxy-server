@@ -250,3 +250,191 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn test_socks5_greeting() {
+        // Создаем фиктивный клиент и сервер
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2];
+            client.read_exact(&mut buffer).await.unwrap();
+
+            // Отправляем ответ на приветствие
+            client
+                .write_all(&[SOCKS_VERSION, AUTH_METHOD_NONE])
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&[SOCKS_VERSION, 1, AUTH_METHOD_NONE])
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+
+        assert_eq!(response, [SOCKS_VERSION, AUTH_METHOD_NONE]);
+    }
+
+    #[tokio::test]
+    async fn test_socks5_authentication_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = Arc::new(Config {
+            users: HashMap::from([("testuser".to_string(), "password123".to_string())]),
+        });
+
+        tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            handle_socks5_client(client, config).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Отправляем приветствие
+        client
+            .write_all(&[SOCKS_VERSION, 1, AUTH_METHOD_USERPASS])
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [SOCKS_VERSION, AUTH_METHOD_USERPASS]);
+
+        // Отправляем аутентификацию
+        let auth_request = [
+            0x01, // Версия аутентификации
+            8,    // Длина имени пользователя
+            b't', b'e', b's', b't', b'u', b's', b'e', b'r', // Имя пользователя
+            11,   // Длина пароля
+            b'p', b'a', b's', b's', b'w', b'o', b'r', b'd', b'1', b'2', b'3', // Пароль
+        ];
+        client.write_all(&auth_request).await.unwrap();
+
+        let mut auth_response = [0u8; 2];
+        client.read_exact(&mut auth_response).await.unwrap();
+        assert_eq!(auth_response, [0x01, AUTH_STATUS_SUCCESS]);
+    }
+
+    #[tokio::test]
+    async fn test_socks5_authentication_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = Arc::new(Config {
+            users: HashMap::from([("testuser".to_string(), "password123".to_string())]),
+        });
+
+        tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            handle_socks5_client(client, config).await.unwrap_err();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Отправляем приветствие
+        client
+            .write_all(&[SOCKS_VERSION, 1, AUTH_METHOD_USERPASS])
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [SOCKS_VERSION, AUTH_METHOD_USERPASS]);
+
+        // Отправляем неверные учетные данные
+        let auth_request = [
+            0x01, // Версия аутентификации
+            8,    // Длина имени пользователя
+            b't', b'e', b's', b't', b'u', b's', b'e', b'r', // Имя пользователя
+            5,    // Длина пароля
+            b'w', b'r', b'o', b'n', b'g', // Неверный пароль
+        ];
+        client.write_all(&auth_request).await.unwrap();
+
+        let mut auth_response = [0u8; 2];
+        client.read_exact(&mut auth_response).await.unwrap();
+        assert_eq!(auth_response, [0x01, AUTH_STATUS_FAILURE]);
+    }
+
+    #[tokio::test]
+    async fn test_http_proxy_with_authentication() {
+        // Запускаем прокси-сервер
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = Arc::new(Config {
+            users: HashMap::from([("user".to_string(), "password".to_string())]),
+        });
+
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let config_clone = config.clone();
+                tokio::spawn(async move {
+                    handle_http_connect(client, config_clone).await.unwrap();
+                });
+            }
+        });
+
+        // Клиент подключается к прокси
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Формируем CONNECT-запрос с аутентификацией
+        let credentials = base64::encode("user:password");
+        let connect_request = format!(
+        "CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org\r\nProxy-Authorization: Basic {}\r\n\r\n",
+        credentials
+    );
+        client.write_all(connect_request.as_bytes()).await.unwrap();
+
+        // Получаем ответ от прокси
+        let mut buffer = [0u8; 1024];
+        let n = client.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("HTTP/1.1 200 Connection Established"));
+    }
+
+    #[tokio::test]
+    async fn test_http_proxy_authentication_failure() {
+        // Запускаем прокси-сервер
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = Arc::new(Config {
+            users: HashMap::from([("user".to_string(), "password".to_string())]),
+        });
+
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let config_clone = config.clone();
+                tokio::spawn(async move {
+                    handle_http_connect(client, config_clone).await.unwrap_err();
+                });
+            }
+        });
+
+        // Клиент подключается к прокси
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Формируем CONNECT-запрос без аутентификации
+        let connect_request = "CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org:443\r\n\r\n";
+        client.write_all(connect_request.as_bytes()).await.unwrap();
+
+        // Получаем ответ от прокси
+        let mut buffer = [0u8; 1024];
+        let n = client.read(&mut buffer).await.unwrap();
+        let response = String::from_utf8_lossy(&buffer[..n]);
+        assert!(response.contains("HTTP/1.1 407 Proxy Authentication Required"));
+    }
+}
