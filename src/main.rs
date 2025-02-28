@@ -1,4 +1,4 @@
-use base64::decode;
+use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -167,7 +167,7 @@ async fn handle_http_connect(
         if line.starts_with("Proxy-Authorization:") {
             let auth_header = line.trim_start_matches("Proxy-Authorization:").trim();
             if let Some(credentials) = auth_header.strip_prefix("Basic ") {
-                if let Ok(decoded) = decode(credentials) {
+                if let Ok(decoded) = general_purpose::STANDARD.decode(credentials) {
                     let creds = String::from_utf8(decoded)?;
                     let parts: Vec<&str> = creds.splitn(2, ':').collect();
                     if parts.len() == 2 {
@@ -391,7 +391,7 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
 
         // Формируем CONNECT-запрос с аутентификацией
-        let credentials = base64::encode("user:password");
+        let credentials = general_purpose::STANDARD.encode("user:password");
         let connect_request = format!(
         "CONNECT httpbin.org:443 HTTP/1.1\r\nHost: httpbin.org\r\nProxy-Authorization: Basic {}\r\n\r\n",
         credentials
